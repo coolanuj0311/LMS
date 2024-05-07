@@ -1,9 +1,11 @@
 import json
-from django.shortcuts import get_object_or_404, render
+from django.utils import timezone
 from rest_framework import status
+from django.core.exceptions import ObjectDoesNotExist
 from django.contrib import messages
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from backend.serializers.deletecourseserializers import DeleteChoiceSerializer
 from core.custom_permissions import SuperAdminPermission
 from core.custom_mixins import (
     SuperAdminMixin)
@@ -21,17 +23,16 @@ from backend.models.allmodels import (
     QuizAttemptHistory,
 )
 from backend.serializers.createcourseserializers import (
-    # CourseStructureSerializer,
     CreateChoiceSerializer,
     CreateQuestionSerializer,
-    QuizSerializer, 
 )
 from django.db import transaction
+from backend.serializers.editserializers import EditingQuestionInstanceOnConfirmationSerializer
 from backend.serializers.courseserializers import (
-    CourseStructureSerializer,
-
+    DeleteQuestionSerializer,
+    EditQuestionInstanceSerializer
 )
-import pandas as pd
+import pandas as pd # type: ignore
 from backend.forms import (
     QuestionForm,
 )
@@ -44,12 +45,15 @@ from django.views.generic import (
 from backend.forms import (
     QuestionForm,
 )
-
 class QuestionView(APIView):
     """
     GET API for super admin to list of questions of specific quiz
     
     POST API for super admin to create new instances of question for the quiz
+    
+    PUT API for super admin to edit question of a quiz
+    
+    PATCH API for super admin to delete question of a quiz
     
     """
     permission_classes = [SuperAdminPermission]
@@ -60,7 +64,7 @@ class QuestionView(APIView):
                 quizzes__id=quiz_id, 
                 active=True, 
                 deleted_at__isnull=True
-            ).order_by('created_at')
+            )
             serializer = QuestionListPerQuizSerializer(questions, many=True)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as e:
@@ -141,8 +145,85 @@ class QuestionView(APIView):
             CourseStructure.objects.filter(course=course_id ,content_type='quiz',content_id=old_quiz_id ).update(content_id=new_quiz_id)
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def put(self, request, course_id, quiz_id, format=None):  
+        error_response = None
+        try:
+            # Extract question_id from request body
+            question_id = request.data.get('question_id')
+            if not question_id:
+                raise ValidationError("Question ID is required in the request body.")
+
+            # Check if quiz exists
+            quiz = Quiz.objects.get(pk=quiz_id)
+
+            # Check if question exists
+            question = Question.objects.get(pk=question_id)
+            if quiz not in question.quizzes.all():
+                raise ValidationError("Question not found for the specified quiz.")
+
+            # Check if course exists
+            course = Course.objects.get(pk=course_id)
+            if course.active:
+                error_response = {"error": "Editing is not allowed for active courses."}
+            elif course not in quiz.courses.all():
+                error_response = {"error": "Quiz not found for the specified course."}
+            else:
+                # Update question instance
+                serializer = EditQuestionInstanceSerializer(question, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                serializer.save()
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except ValidationError as e:
+            error_response = {"error": str(e)}
+        
+        if error_response:
+            return Response(error_response, status=status.HTTP_400_BAD_REQUEST)
+
+        # Handle other unexpected errors
+        return Response({"error": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+    def patch(self, request, course_id, quiz_id, format=None):
+        error_response = None
+        try:
+            # Validate request data
+            serializer = DeleteQuestionSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            # Extract validated question_id
+            question_id = serializer.validated_data['question_id']
+            
+            # Fetch the question instance
+            question = Question.objects.get(id=question_id)
+
+            # Check if the question is associated with the specified quiz
+            if quiz_id not in question.quizzes.values_list('id', flat=True):
+                error_response = {"error": "Question not found for the specified quiz."}
+            else:
+                # Check if the question is associated with other quizzes
+                other_quizzes_count = question.quizzes.exclude(id=quiz_id).count()
+                if other_quizzes_count > 0:
+                    # Only remove the relation with the current quiz
+                    question.quizzes.remove(quiz_id)
+                else:
+                    # No other quizzes are associated, soft delete the question
+                    question.deleted_at = timezone.now()
+                    question.active = False
+                    question.save()
+
+                return Response({"message": "Question deleted successfully."}, status=status.HTTP_204_NO_CONTENT)
+
+        except ObjectDoesNotExist:
+            error_response = {"error": "Question not found."}
+
+        if error_response:
+            return Response(error_response, status=status.HTTP_404_NOT_FOUND)
+
+        # Handle other unexpected errors
+        return Response({"error": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
 class ChoicesView(APIView):
     """
     GET API for super admin to list of choices of specific question
@@ -158,7 +239,7 @@ class ChoicesView(APIView):
                 question__id=question_id, 
                 active=True, 
                 deleted_at__isnull=True
-            ).order_by('created_at')
+            )
             serializer = ChoicesListPerQuestionSerializer(choices, many=True)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as e:
@@ -181,8 +262,29 @@ class ChoicesView(APIView):
                     return Response({"error": "Validation Error: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
                 else:
                     return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
+    def patch(self, request, question_id):
+        try:
+            serializer = DeleteChoiceSerializer(data=request.query_params)
+            serializer.is_valid(raise_exception=True)
+            choice_id = serializer.validated_data.get('choice_id')
+            choice = Choice.objects.get(id=choice_id, question_id=question_id)
+            # Check if the choice instance has already been soft deleted
+            if choice.deleted_at:
+                return Response({'error': 'Choice already soft deleted'}, status=status.HTTP_400_BAD_REQUEST)
+            # Soft delete the choice instance by marking it as deleted
+            choice.deleted_at = timezone.now()
+            choice.active = False
+            choice.save()
+            # Return success response
+            return Response({'message': 'Choice soft deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            error_message = 'Course structure not found'
+            if isinstance(e, serializers.ValidationError):
+                error_message = e.detail
+                status_code = status.HTTP_400_BAD_REQUEST
+            else:
+                status_code = status.HTTP_404_NOT_FOUND
+            return Response({'error': error_message}, status=status_code)
 
 # @method_decorator([login_required], name="dispatch")
 class QuizTake(FormView):
@@ -340,7 +442,45 @@ class QuizTake(FormView):
 
         return render(self.request, self.result_template_name, results)
 
-# def dummy_quiz_index(request, course_id):
-#     course = Course.objects.get(pk=course_id)
-#     return render(request, 'quiz_index.html', {'course_id': course_id, 'course': course})
+def dummy_quiz_index(request, course_id):
+    course = Course.objects.get(pk=course_id)
+    return render(request, 'quiz_index.html', {'course_id': course_id, 'course': course})
 
+class EditingQuestionInstanceOnConfirmationView(APIView):
+    
+    """ 
+    PUT API : for editing question if the confirmation is true then editing allowed
+    
+    """
+    permission_classes = [SuperAdminPermission]
+    def put(self, request, course_id, quiz_id, format=None):
+        try:
+            serializer = EditingQuestionInstanceOnConfirmationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            confirmation = serializer.validated_data['confirmation']
+            quiz = Quiz.objects.get(pk=quiz_id)
+            questions = quiz.questions.all()
+            
+            if confirmation:
+                # Editing existing question instances
+                for question in questions:
+                    question.figure = serializer.validated_data.get('figure', question.figure)
+                    if 'content' in serializer.validated_data and serializer.validated_data['content'] is not None:
+                        question.content = serializer.validated_data['content']
+                    question.explanation = serializer.validated_data.get('explanation', question.explanation)
+                    question.choice_order = serializer.validated_data.get('choice_order', question.choice_order)
+                    question.updated_at = timezone.now()
+                    question.save()
+                
+                return Response({"message": "Question instances updated successfully."}, status=status.HTTP_200_OK)
+            else:
+                # Do not allow updating, suggest creating a new question
+                return Response({"message": "You chose not to update existing questions. Please create new ones instead."},
+                                status=status.HTTP_400_BAD_REQUEST)
+        
+        except (Quiz.DoesNotExist, Exception) as e:
+            if isinstance(e, Quiz.DoesNotExist):
+                return Response({"error": "Quiz not found"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

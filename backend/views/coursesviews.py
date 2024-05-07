@@ -8,16 +8,22 @@ from django.utils import timezone
 from django.db.models import Q
 from rest_framework import status
 from django.db import transaction
-import pandas as pd
-
+import pandas as pd # type: ignore
 from core.custom_permissions import SuperAdminOrGetOnly, SuperAdminPermission
 from backend.serializers.courseserializers import CourseDisplaySerializer
 from backend.serializers.registercourseserializers import (
     DerivedVersionActiveCourseListSerializer, 
     FirstVersionActiveCourseListSerializer
 )
+from core.custom_mixins import (
+    ClientAdminMixin,
+    ClientMixin,
+    SuperAdminMixin
+)
 from backend.models.allmodels import (
+    ActivityLog,
     Course,
+    Notification,
     UploadVideo,
     UploadReadingMaterial,
     CourseStructure,
@@ -27,22 +33,29 @@ from backend.models.allmodels import (
 from backend.serializers.createcourseserializers import (
     ActivateCourseSerializer,
     CourseSerializer, 
-    # CourseStructureSerializer,
     InActivateCourseSerializer, 
     CreateCourseSerializer,
 )
-from backend.serializers.courseserializers import (
+
+from backend.serializers.deletecourseserializers import(
+    EditCourseInstanceSerializer,
+    DeleteSelectedCourseSerializer,
+)
+from backend.serializers.courseserializers import(
     CourseStructureSerializer,
 
 )
 from core.constants import filtered_display_list, manage_course_list
-
 
 class CourseView(APIView):
     """
     GET API for super admin to list of courses or single instance based on query parameters passed
     
     POST API for super admin to create new instances of course
+    
+    PUT API for super admin to edit courses
+    
+    PATCH API for super admin to delete courses
     """
     permission_classes = [SuperAdminOrGetOnly]
 
@@ -102,7 +115,90 @@ class CourseView(APIView):
             
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    def put(self, request, format=None):
+        try:
+            course_id = request.data.get('course_id')
+            course = Course.objects.get(pk=course_id)
+            
+            if not course:
+                raise Course.DoesNotExist("No course found with the provided course ID.")
+            if course.deleted_at:
+                raise ValidationError("Course instance has been deleted")
+            
+            serializer = EditCourseInstanceSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
 
+            course.title = serializer.validated_data.get('title')
+            course.summary = serializer.validated_data.get('summary')
+            course.updated_at = timezone.now()
+            course.save()
+
+            if course.active:
+                latest_activity_log = ActivityLog.objects.latest('created_at')
+                notification = Notification.objects.create(
+                    message=latest_activity_log.message,
+                    course=course
+                )
+                notification_data = {
+                    "message": notification.message,
+                    "created_at": notification.created_at
+                }
+                return Response({"message": "Course instance updated successfully", "notification": notification_data}, status=status.HTTP_200_OK)
+            return Response({"message": "Course instance updated successfully"}, status=status.HTTP_200_OK)
+        
+        except Exception as e:
+            error_message = str(e)
+            if isinstance(e, (ValidationError, Course.DoesNotExist)):
+                error_message = "Invalid data: " + error_message
+            return Response({"error": error_message}, status=status.HTTP_400_BAD_REQUEST) 
+
+
+    def patch(self, request, format=None):
+        try:
+           
+            serializer = DeleteSelectedCourseSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            course_id = serializer.validated_data['course_id']
+
+            # Fetch the course instance
+            course = Course.objects.get(id=course_id)
+
+            # Check if the course is active
+            if course.active:
+                raise ValidationError("Course must be inactive before deletion.")
+
+            # Soft delete the course
+            course.active = False
+            course.deleted_at = timezone.now()
+            course.save()
+
+            # Delete related instances if they are associated only with this course
+            self.delete_related_instances(course)
+
+            return Response({"message": "Course soft deleted successfully."}, status=status.HTTP_204_NO_CONTENT)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def delete_related_instances(self, course):
+        # Delete mapped instances of course_id with reading material
+        reading_materials = UploadReadingMaterial.objects.filter(courses=course)
+        if reading_materials.exists():
+            reading_materials.delete()
+
+        # Delete mapped instances of course_id with video material
+        video_materials = UploadVideo.objects.filter(courses=course)
+        if video_materials.exists():
+            video_materials.delete()
+
+        # Delete mapped instances of course_id with quiz and associated questions
+        quizzes = Quiz.objects.filter(courses=course)
+        for quiz in quizzes:
+            if quiz.questions.count() > 0:
+                quiz.questions.all().delete()
+            quiz.delete()
+        
 
 class ManageCourseView(APIView):
     """

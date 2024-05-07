@@ -184,6 +184,8 @@ class UploadVideo(models.Model):
             FileExtensionValidator(["mp4", "mkv", "wmv", "3gp", "f4v", "avi", "mp3"])
         ],
     )
+    url = models.URLField(max_length=200,default='')
+    video_duration = models.DurationField(help_text="Duration of the video", null=True)
     summary = models.TextField(null=True, blank=True)
     uploaded_at = models.DateTimeField(auto_now=False, auto_now_add=True, null=True)
     updated_at = models.DateTimeField(auto_now=True, auto_now_add=False, null=True)
@@ -231,6 +233,9 @@ def log_delete(sender, instance, **kwargs):
         message=f"The video '{instance.title}' of the course '{instance.courses}' has been deleted."
     )
 
+# -------------------------------------
+    # Quiz models
+# -------------------------------------
 # -------------------------------------
     # Quiz models
 # -------------------------------------

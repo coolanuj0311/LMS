@@ -30,3 +30,5 @@ class CountCoursesStatusSerializer(serializers.Serializer):
             if value < 0:
                 raise serializers.ValidationError(f"{field_name} count must be positive")
         return data
+
+

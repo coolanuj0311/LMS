@@ -1,6 +1,8 @@
+from datetime import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from backend.serializers.deletecourseserializers import DeleteCourseStructureSerializer
 from core.custom_permissions import CourseContentPermissions, SuperAdminOrGetOnly
 from rest_framework import status
 from backend.models.allmodels import (
@@ -26,6 +28,52 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError
 from backend.models.coremodels import *
 from backend.serializers.courseserializers import *
+from django.utils import timezone
+from rest_framework import status
+from django.core.exceptions import ObjectDoesNotExist
+from rest_framework.views import APIView
+from rest_framework.exceptions import ValidationError
+from core.custom_permissions import CourseContentPermissions, SuperAdminOrGetOnly, SuperAdminPermission
+from backend.models.coremodels import *
+from backend.serializers.courseserializers import *
+from rest_framework.views import APIView
+from django.shortcuts import get_object_or_404, render
+from django.db import transaction
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from core.custom_mixins import (
+    ClientAdminMixin,
+    ClientMixin,
+    SuperAdminMixin)
+from rest_framework import status
+from backend.models.allmodels import (
+    Course,
+    CourseRegisterRecord,
+    UploadReadingMaterial,
+    CourseStructure,
+    CourseEnrollment,
+    Quiz,
+    Notification
+)
+from backend.serializers.editserializers import EditingQuizInstanceOnConfirmationSerializer
+from backend.serializers.createcourseserializers import (
+    CreateCourseStructureSerializer,
+    CreateQuizSerializer,
+    CreateUploadReadingMaterialSerializer,
+)
+from backend.serializers.courseserializers import (
+    QuizSerializer,
+)
+
+from backend.serializers.editcourseserializers import (
+    DeleteReadingMaterialSerializer,
+    DeleteSelectedQuizSerializer,
+    EditQuizInstanceSerializer,
+    UploadReadingMaterialSerializer,
+    NotificationSerializer
+    
+    )
+from core.constants import filtered_display_list, manage_course_list
 
 class CourseStructureView(APIView):
     """
@@ -35,10 +83,9 @@ class CourseStructureView(APIView):
     
     """
     permission_classes = [SuperAdminOrGetOnly]
-    
     def get(self, request, course_id, format=None):
         try:
-            course_structures = CourseStructure.objects.filter(course_id=course_id,active=True, deleted_at__isnull=True).order_by('-created_at') # active=True,
+            course_structures = CourseStructure.objects.filter(course_id=course_id, deleted_at__isnull=True) # active=True,
             if course_structures is not None:
                 serializer = CourseStructureSerializer(course_structures, many=True)
                 return Response(serializer.data, status=status.HTTP_200_OK)
@@ -129,6 +176,29 @@ class CourseStructureView(APIView):
                     return Response({"error": "Validation Error: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
                 else:
                     return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    def patch(self, request, course_id):
+        try:
+            # Validate request data using serializer
+            serializer = DeleteCourseStructureSerializer(data=request.query_params)
+            serializer.is_valid(raise_exception=True)
+            instance_id = serializer.validated_data.get('instance_id')
+            course_structure = CourseStructure.objects.get(course_id=course_id, id=instance_id)
+            # Check if the course structure instance has already been soft deleted
+            if course_structure.deleted_at is not None:
+                return Response({'error': 'Course structure already soft deleted'}, status=status.HTTP_400_BAD_REQUEST)
+            # Soft delete the course structure instance by marking it as deleted
+            course_structure.deleted_at = timezone.now()
+            course_structure.active = False  
+            course_structure.save()
+            return Response({'message': 'Course structure soft deleted successfully'}, status=status.HTTP_200_OK)
+        except Exception as e:
+            error_message = 'Course structure not found'
+            if isinstance(e, serializers.ValidationError):
+                error_message = e.detail
+                status_code = status.HTTP_400_BAD_REQUEST
+            else:
+                status_code = status.HTTP_404_NOT_FOUND
+            return Response({'error': error_message}, status=status_code)
 
 
 class ReadingMaterialView(APIView):
@@ -137,23 +207,17 @@ class ReadingMaterialView(APIView):
     
     POST API for super admin to create new instances of course structure while editing existing too
     
+    PUT API for super admin to edit reading material 
+    
+    PATCH API for super admin to delete reading material 
+    
     """
     permission_classes = [CourseContentPermissions]
     def get(self, request, course_id, format=None):
         
         try:
             content_id = request.query_params.get('content_id')
-            count_calculator = request.query_params.get('count_calculator', '').lower() == 'true'
             list_mode = request.query_params.get('list', '').lower() == 'true'  # Check if list mode is enabled
-            if count_calculator:
-                if course_id:
-                    reading_material_count = UploadReadingMaterial.objects.filter(courses__id=course_id, active=True, deleted_at__isnull=True).count()
-                    if reading_material_count is None:
-                        return Response({"message": " no Reading material found"}, status=status.HTTP_404_NOT_FOUND)
-                    serializer = ReadingMaterialCountPerCourseSerializer({'reading_material_count': reading_material_count})
-                    return Response(serializer.data, status=status.HTTP_200_OK)
-                else:
-                    return Response({"error": "no course id was passed in parameters "}, status=status.HTTP_400_BAD_REQUEST)
             if content_id:
                 reading_material = UploadReadingMaterial.objects.get(
                     courses__id=course_id, 
@@ -164,14 +228,12 @@ class ReadingMaterialView(APIView):
                 if reading_material :
                     serializer = ReadingMaterialSerializer(reading_material)
                     return Response(serializer.data, status=status.HTTP_200_OK)
-                else:
-                    return Response("error: no reading material found", status=status.HTTP_404_NOT_FOUND)
             elif list_mode:
                 reading_materials = UploadReadingMaterial.objects.filter(
                     courses__id=course_id, 
                     active=True, 
                     deleted_at__isnull=True
-                ).order_by('-uploaded_at')
+                )
                 serializer = ReadingMaterialListPerCourseSerializer(reading_materials, many=True)
                 return Response(serializer.data, status=status.HTTP_200_OK)
             else:
@@ -199,26 +261,31 @@ class ReadingMaterialView(APIView):
                 # Set additional fields
                 serializer.validated_data['courses'] = [course_id]
                 reading_material = serializer.save()
-                try:
-                    last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
-                except CourseStructure.DoesNotExist:
-                    last_order_number = 0
+                # If original_course is null, only save reading material
+                if course.original_course is None:
+                    return Response({"message": "Reading material created successfully"}, status=status.HTTP_201_CREATED)
+                else:
+                    # If original_course is not null, also create a CourseStructure entry
+                    try:
+                        last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
+                    except CourseStructure.DoesNotExist:
+                        last_order_number = 0
                     print('starting with course structure')
                     # Create new CourseStructure instance
-                course_structure_data = {
+                    course_structure_data = {
                         # 'course': course_id,
                         'course' : course_id,
                         'order_number': last_order_number + 1,
                         'content_type': 'reading',
                         'content_id': reading_material.pk
-                }
-                print(course_structure_data)
-                course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
-                if course_structure_serializer.is_valid():
-                    course_structure_serializer.save()
-                    return Response({"message": "Reading material created successfully"}, status=status.HTTP_201_CREATED)
-                else:
-                    return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+                    }
+                    print(course_structure_data)
+                    course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
+                    if course_structure_serializer.is_valid():
+                        course_structure_serializer.save()
+                        return Response({"message": "Reading material created successfully"}, status=status.HTTP_201_CREATED)
+                    else:
+                        return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
@@ -226,63 +293,89 @@ class ReadingMaterialView(APIView):
                     return Response({"error": "Validation Error: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
                 else:
                     return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def put(self, request, course_id, format=None):
+        try:
 
-    # def put(self, request, course_id, *args, **kwargs):
-    #     content_id = request.query_params.get('content_id')
-    #     course = Course.objects.get(id=content_id)
-    #     if course.active == True:
-    #         return Response({"error": 'we can not update active course'}, status=status.HTTP_403_FORBIDDEN)
-    #     reading_material = UploadReadingMaterial.objects.get(
-    #             courses__id=course_id, 
-    #             id=content_id, 
-    #             active=True, 
-    #             deleted_at__isnull=True
-    #         )
-    #     if reading_material is None:
-    #         return Response({"error": "Reading material not found"}, status=status.HTTP_404_NOT_FOUND)
+            reading_material_id = request.data.get('reading_material_id')
+            
+            if reading_material_id is None:
+                return Response({"error": "reading_material_id is required in the request body."},
+                                status=status.HTTP_400_BAD_REQUEST)
+            
+            with transaction.atomic():
+                # Get the reading material instance
+                reading_material = get_object_or_404(UploadReadingMaterial, pk=reading_material_id)
+                
+                # Check if the associated course is active
+                if reading_material.courses.filter(pk=course_id, active=True).exists():
+                    return Response({"error": "Cannot edit reading material. Course is active."},
+                                    status=status.HTTP_403_FORBIDDEN)
+
+                # Validate request data
+                serializer = UploadReadingMaterialSerializer(instance=reading_material, data=request.data, partial=True)
+                serializer.is_valid(raise_exception=True)
+                serializer.save(updated_at=timezone.now())
+
+                # Return success response with message
+                return Response({"message": "Reading material updated successfully.", "data": serializer.data}, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            error_message = str(e)
+            if isinstance(e, (UploadReadingMaterial.DoesNotExist, ValidationError)):
+                error_message = "Reading material not found." if isinstance(e, UploadReadingMaterial.DoesNotExist) else str(e)
+                status_code = status.HTTP_404_NOT_FOUND
+            else:
+                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+            return Response({"error": error_message}, status=status_code)
+    
+    def patch(self, request, course_id, format=None):
+        try:
+
+            reading_material_id = request.data.get('reading_material_id')
+            
+            if reading_material_id is None:
+                return Response({"error": "reading_material_id is required in the request body."},
+                                status=status.HTTP_400_BAD_REQUEST)
+            
+            # Fetch the reading material instance
+            reading_material = get_object_or_404(UploadReadingMaterial, pk=reading_material_id)
+            
+            # Validate request data
+            serializer = DeleteReadingMaterialSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            with transaction.atomic():
+                # Check if the reading material is associated with other courses
+                other_courses_count = reading_material.courses.exclude(id=course_id).count()
+                if other_courses_count > 0:
+                    # Only remove the relation with the current course
+                    reading_material.courses.remove(course_id)
+                else:
+                    # No other courses are associated, soft delete the reading material
+                    reading_material.deleted_at = timezone.now()
+                    reading_material.active = False
+                    reading_material.save()
+                
+                return Response({"message": "Reading material deleted successfully."}, status=status.HTTP_204_NO_CONTENT)
         
-    #     edit_type = request.query_params.get('edit_type')
-    #     if edit_type not in ['content', 'status']:
-    #         return Response({"error": "Invalid edit_type in query parameter"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            error_message = str(e)
+            if isinstance(e, (UploadReadingMaterial.DoesNotExist, ValidationError)):
+                error_message = "Reading material not found." if isinstance(e, UploadReadingMaterial.DoesNotExist) else str(e)
+                status_code = status.HTTP_404_NOT_FOUND
+            else:
+                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
 
-    #     if edit_type == 'content':
-    #         # Code for editing content
-    #         pass
-        
-    #     elif edit_type == 'status':
-    #         if reading_material.active:
-    #             reading_material.active = False
-    #             course_structure = CourseStructure.objects.filter(content_id=content_id, content_type='reading', active=True, deleted_at__isnull=True)
-    #             course_structure.update(active=False)
-    #         else:
-    #             reading_material.active = True
-    #             course_structure = CourseStructure.objects.filter(content_id=content_id, content_type='reading', active=False, deleted_at__isnull=True)
-    #             try:
-    #                 last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
-    #             except CourseStructure.DoesNotExist:
-    #                     last_order_number = 0
-    #             course_structure_data = {
-    #                 'course': course_id,
-    #                 'order_number': last_order_number + 1,
-    #                 'content_type': 'reading',
-    #                 'content_id': reading_material.pk
-    #             }
-    #             course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
-    #             if course_structure_serializer.is_valid():
-    #                 course_structure_serializer.save()
-    #             else:
-    #                 return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-        
-    #     reading_material.save()
-    #     return Response({"message": "Reading material status updated successfully"}, status=status.HTTP_200_OK)
-
-
-
+            return Response({"error": error_message}, status=status_code)
 
 class QuizView(APIView):
     """
         get: to retrieve the quiz of course in url (for authorized all)
         post: to create quiz instances for course in url (for super admin only)
+        put : to edit quiz 
+        patch : to delete a quiz 
     """
     permission_classes = [CourseContentPermissions]
     
@@ -291,16 +384,6 @@ class QuizView(APIView):
             
             content_id = request.query_params.get('content_id')
             list_mode = request.query_params.get('list', '').lower() == 'true'  # Check if list mode is enabled
-            count_calculator = request.query_params.get('count_calculator', '').lower() == 'true'
-            if count_calculator:
-                if course_id:
-                    quiz_count = Quiz.objects.filter(courses__id=course_id, active=True, deleted_at__isnull=True).count()
-                    if quiz_count is None:
-                        return Response({"message": " no quiz found"}, status=status.HTTP_404_NOT_FOUND)
-                    serializer = QuizCountPerCourseSerializer({'quiz_count': quiz_count})
-                    return Response(serializer.data, status=status.HTTP_200_OK)
-                else:
-                    return Response({"error": "no course id was passed in parameters "}, status=status.HTTP_400_BAD_REQUEST)
             if content_id:
                 quiz = Quiz.objects.get(
                     courses__id=course_id, 
@@ -318,7 +401,7 @@ class QuizView(APIView):
                     courses__id=course_id, 
                     active=True, 
                     deleted_at__isnull=True
-                ).order_by('-created_at')
+                )
                 serializer = QuizListPerCourseSerializer(quizzes, many=True)
                 return Response(serializer.data, status=status.HTTP_200_OK)
             else:
@@ -348,23 +431,28 @@ class QuizView(APIView):
             if serializer.is_valid():
                 quiz = serializer.save()
                 course.quizzes.add(quiz)
-                try:
-                    last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
-                except CourseStructure.DoesNotExist:
-                    last_order_number = 0
+                # If original_course is null, only save quiz
+                if course.original_course is None:
+                    return Response({"message": "Quiz created successfully"}, status=status.HTTP_201_CREATED)
+                else:
+                    # If original_course is not null, also create a CourseStructure entry
+                    try:
+                        last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
+                    except CourseStructure.DoesNotExist:
+                        last_order_number = 0
                     # Create new CourseStructure instance
-                course_structure_data = {
+                    course_structure_data = {
                         'course': course_id,
                         'order_number': last_order_number + 1,
                         'content_type': 'quiz',
                         'content_id': quiz.pk
-                }
-                course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
-                if course_structure_serializer.is_valid():
-                    course_structure_serializer.save()
-                    return Response({"message": "Quiz created successfully"}, status=status.HTTP_201_CREATED)
-                else:
-                    return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+                    }
+                    course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
+                    if course_structure_serializer.is_valid():
+                        course_structure_serializer.save()
+                        return Response({"message": "Quiz created successfully"}, status=status.HTTP_201_CREATED)
+                    else:
+                        return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
@@ -372,53 +460,154 @@ class QuizView(APIView):
                     return Response({"error": "Validation Error: " + str(e)}, status=status.HTTP_400_BAD_REQUEST)
                 else:
                     return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def put(self, request, course_id, format=None):
+        try:
+            
+            # Check if course exists
+            course = Course.objects.get(pk=course_id)
+            if course.active:
+                return Response({"error": "Editing is not allowed for active courses."},
+                                status=status.HTTP_403_FORBIDDEN)
+
+            # Check if quiz exists
+            quiz_id = request.data.get('quiz_id', None)
+            if not quiz_id:
+                return Response({"error": "Quiz ID is required in the request body."}, status=status.HTTP_400_BAD_REQUEST)
+            quiz = Quiz.objects.get(pk=quiz_id)
+            if course not in quiz.courses.all():
+                return Response({"error": "Quiz not found for the specified course."},
+                                status=status.HTTP_404_NOT_FOUND)
+
+            # Update quiz instance
+            serializer = EditQuizInstanceSerializer(quiz, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except ObjectDoesNotExist as e:
+            error_message = "Resource not found" if isinstance(e, ObjectDoesNotExist) else str(e)
+            status_code = status.HTTP_404_NOT_FOUND if isinstance(e, ObjectDoesNotExist) else status.HTTP_500_INTERNAL_SERVER_ERROR
+            return Response({"error": error_message}, status=status_code)
+    
+    def patch(self, request, course_id, format=None):
+        try:
+            quiz_id = request.data.get('quiz_id', None)
+            if not quiz_id:
+                return Response({"error": "Quiz ID is required in the request body."}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Validate request data
+            serializer = DeleteSelectedQuizSerializer(data={'quiz_id': quiz_id})
+            serializer.is_valid(raise_exception=True)
+            
+            # Fetch the quiz instance
+            quiz = Quiz.objects.get(id=quiz_id)
+            
+            # Check if the quiz is associated with other courses
+            other_courses_count = quiz.courses.exclude(id=course_id).count()
+            if other_courses_count > 0:
+                # Only remove the relation with the current course
+                quiz.courses.remove(course_id)
+            else:
+                # No other courses are associated, soft delete the quiz
+                quiz.deleted_at = timezone.now()
+                quiz.active = False
+                quiz.save()
                 
+            return Response({"message": "Quiz deleted successfully."}, status=status.HTTP_204_NO_CONTENT)
 
-    # def put(self, request, course_id, *args, **kwargs):
-    #     content_id = request.query_params.get('content_id')
-    #     course = Course.objects.get(id=content_id)
-    #     if course.active == True:
-    #         return Response({"error": 'we can not update active course'}, status=status.HTTP_403_FORBIDDEN)
-    #     quiz = Quiz.objects.get(
-    #             courses__id=course_id, 
-    #             id=content_id, 
-    #             active=True, 
-    #             deleted_at__isnull=True
-    #         )
-    #     if quiz is None:
-    #         return Response({"error": "quiz not found"}, status=status.HTTP_404_NOT_FOUND)
-        
-    #     edit_type = request.query_params.get('edit_type')
-    #     if edit_type not in ['content', 'status']:
-    #         return Response({"error": "Invalid edit_type in query parameter"}, status=status.HTTP_400_BAD_REQUEST)
+        except ObjectDoesNotExist as e:
+            error_message = "Quiz not found" if isinstance(e, ObjectDoesNotExist) else "Internal Server Error"
+            status_code = status.HTTP_404_NOT_FOUND if isinstance(e, ObjectDoesNotExist) else status.HTTP_500_INTERNAL_SERVER_ERROR
+            return Response({"error": error_message}, status=status_code)
 
-    #     if edit_type == 'content':
-    #         # Code for editing content
-    #         pass
+class NotificationBasedOnCourseDisplayView(SuperAdminMixin,ClientAdminMixin,ClientMixin,APIView):
+    
+    """  
+    GET API : for all to get notification related to any update i courses
+    """
+    # permission_classes = [IsAuthenticated]
+
+    def get(self, request, course_id, format=None):
+        try:
+            # user = request.user
+            user = request.data.get('user')
+            
+            # Fetch notifications for the specified course
+            notifications = Notification.objects.filter(course_id=course_id)
+            
+            if not notifications.exists():
+                return Response({"message": "No notifications found"}, status=status.HTTP_404_NOT_FOUND)
+
+            if self.has_super_admin_privileges(request):
+              #  print('we are super')
+                serializer = NotificationSerializer(notifications, many=True)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+            if self.has_client_admin_privileges(request):
+               #  print('we are client')
+                course_enrollment = CourseEnrollment.objects.get(user=user['id'], course_id=course_id)
+                enrollment_date = course_enrollment.enrolled_at
+                new_notifications = notifications.filter(created_at__gt=enrollment_date)
+            
+            serializer = NotificationSerializer(new_notifications, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        except (CourseEnrollment.DoesNotExist, CourseRegisterRecord.DoesNotExist) as e:
+            return Response({"error": "User is not enrolled or registered in this course."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class EditQuizInstanceOnConfirmationView(APIView):
+    """ 
+    PUT API : for super admin to edit quiz if confirmation is true if not then new quiz is created
+    """
+    permission_classes = [SuperAdminPermission]
+    def put(self, request, course_id, quiz_id, format=None):
+        try:
+            serializer = EditingQuizInstanceOnConfirmationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            confirmation = serializer.validated_data['confirmation']
+            quiz = Quiz.objects.get(pk=quiz_id)
+            course = quiz.courses.first()  # Assuming each quiz is related to only one course
+            
+            if confirmation:
+                # Editing existing quiz instance
+                if course.active:
+                    return Response({"error": "Editing is not allowed for active courses."},
+                                    status=status.HTTP_403_FORBIDDEN)
+
+                quiz.title = serializer.validated_data.get('title', quiz.title)
+                quiz.description = serializer.validated_data.get('description', quiz.description)
+                quiz.answers_at_end = serializer.validated_data.get('answers_at_end', quiz.answers_at_end)
+                quiz.exam_paper = serializer.validated_data.get('exam_paper', quiz.exam_paper)
+                quiz.pass_mark = serializer.validated_data.get('pass_mark', quiz.pass_mark)
+                quiz.updated_at = timezone.now()
+                quiz.save()
+
+                return Response({"message": "Quiz instance updated successfully."}, status=status.HTTP_200_OK)
+            else:
+                # Creating new quiz instance
+                new_quiz = Quiz.objects.create(
+                    title=serializer.validated_data.get('title'),
+                    description=serializer.validated_data.get('description'),
+                    answers_at_end=serializer.validated_data.get('answers_at_end'),
+                    exam_paper=serializer.validated_data.get('exam_paper'),
+                    pass_mark=serializer.validated_data.get('pass_mark'),
+                )
+
+                # Update CourseStructure entry with the new quiz id
+                CourseStructure.objects.filter(course=course_id, content_type='quiz', content_id=quiz_id) \
+                    .update(content_id=new_quiz.id)
+
+                return Response({"message": "New quiz instance created successfully."}, status=status.HTTP_201_CREATED)
         
-    #     elif edit_type == 'status':
-    #         if quiz.active:
-    #             quiz.active = False
-    #             course_structure = CourseStructure.objects.filter(content_id=content_id, content_type='quiz', active=True, deleted_at__isnull=True)
-    #             course_structure.update(active=False)
-    #         else:
-    #             quiz.active = True
-    #             course_structure = CourseStructure.objects.filter(content_id=content_id, content_type='quiz', active=False, deleted_at__isnull=True)
-    #             try:
-    #                 last_order_number = CourseStructure.objects.filter(course=course).latest('order_number').order_number
-    #             except CourseStructure.DoesNotExist:
-    #                     last_order_number = 0
-    #             course_structure_data = {
-    #                 'course': course_id,
-    #                 'order_number': last_order_number + 1,
-    #                 'content_type': 'quiz',
-    #                 'content_id': quiz.pk
-    #             }
-    #             course_structure_serializer = CreateCourseStructureSerializer(data=course_structure_data)
-    #             if course_structure_serializer.is_valid():
-    #                 course_structure_serializer.save()
-    #             else:
-    #                 return Response({"error": course_structure_serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-        
-    #     quiz.save()
-    #     return Response({"message": "quiz status updated successfully"}, status=status.HTTP_200_OK)
+        except (Quiz.DoesNotExist, Exception) as e:
+            if isinstance(e, Quiz.DoesNotExist):
+                return Response({"error": "Quiz not found"}, status=status.HTTP_404_NOT_FOUND)
+            else:
+                return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+   
