@@ -1,6 +1,6 @@
 from rest_framework import permissions
 from backend.models.allmodels import CourseEnrollment, CourseRegisterRecord
-from core.custom_mixins import ClientAdminMixin, SuperAdminMixin
+from core.custom_mixins import ClientAdminMixin, ClientMixin, SuperAdminMixin
 from backend.models.coremodels import UserRolePrivileges
 
 '''
@@ -24,6 +24,9 @@ class ClientAdminPermission(ClientAdminMixin, permissions.BasePermission):
         print('ClientAdminPermission')
         privilege_response = self.has_client_admin_privileges(request)
         return privilege_response
+class ClientPermission(permissions.BasePermission, ClientMixin):
+    def has_permission(self, request, view):
+        return self.has_client_privileges(request)
     
 class SuperAdminOrGetOnly(SuperAdminMixin,permissions.BasePermission):
     """
@@ -45,6 +48,23 @@ class SuperAdminOrGetOnly(SuperAdminMixin,permissions.BasePermission):
             return True
         return False
 
+class SuperAdminOrPostOnly(permissions.BasePermission):
+    """
+        Permission class which allow users which are not super users to access POST request functionality only
+    """
+    def has_permission(self, request, view):
+        print('all users has access')
+        if request.method == 'POST':
+            # special condition for GET request in  CourseView API
+            # if request.path.startswith('/lms/courses/'):
+            if request.path == ['/lms/complete-quiz-count','/lms/total-score-per-course','/lms/course-completion-status-per-user']:
+                print('did path thing worked ')
+                course_id = request.query_params.get('course_id')
+                filtered_display = request.query_params.get('filtered_display')
+                if not course_id or filtered_display in ["inactive", "all"]:
+                    return False
+            return True
+        return False
 
 class CourseContentPermissions(permissions.BasePermission, SuperAdminMixin, ClientAdminMixin):
     
