@@ -112,3 +112,10 @@ class CourseContentPermissions(permissions.BasePermission, SuperAdminMixin, Clie
 #                     return True
 
 #         return False
+class IsClientOrAdmin(permissions.BasePermission):
+    """
+    Custom permission to allow access to client admins or clients.
+    """
+    def has_permission(self, request, view):
+        print('IsClientOrAdmin')
+        return request.data.get("customer_id") is not None or request.data.get("user_id") is not None
