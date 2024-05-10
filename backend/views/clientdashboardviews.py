@@ -1,7 +1,7 @@
 from rest_framework import  status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from core.custom_permissions import ClientPermission
+from core.custom_permissions import ClientPermission, SuperAdminPermission
 from backend.models.allmodels import (
     CourseCompletionStatusPerUser,
     CourseEnrollment,
